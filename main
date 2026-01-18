@@ -1,0 +1,196 @@
+import os
+import numpy as np
+import pandas as pd
+
+# ============================================================
+# 0) LOAD DATA (Robust CSV reading)
+# ============================================================
+match = pd.read_csv("matches.csv")
+delivery = pd.read_csv("deliveries.csv", on_bad_lines='skip')
+
+
+# ============================================================
+# 1) FIRST INNINGS TOTAL SCORE (TARGET)
+# ============================================================
+total_score_df = (
+    delivery.groupby(['match_id', 'inning'])['total_runs']
+    .sum()
+    .reset_index()
+)
+total_score_df = total_score_df[total_score_df['inning'] == 1].copy()
+
+# Merge target with match data
+match_df = match.merge(
+    total_score_df[['match_id', 'total_runs']],
+    left_on='id',
+    right_on='match_id'
+)
+
+# ============================================================
+# 2) TEAM CLEANING + FILTERING
+# ============================================================
+teams = [
+    'Sunrisers Hyderabad',
+    'Mumbai Indians',
+    'Royal Challengers Bangalore',
+    'Kolkata Knight Riders',
+    'Kings XI Punjab',
+    'Chennai Super Kings',
+    'Rajasthan Royals',
+    'Delhi Capitals'
+]
+
+# Standardize team names
+match_df['team1'] = match_df['team1'].str.replace('Delhi Daredevils', 'Delhi Capitals', regex=False)
+match_df['team2'] = match_df['team2'].str.replace('Delhi Daredevils', 'Delhi Capitals', regex=False)
+match_df['team1'] = match_df['team1'].str.replace('Deccan Chargers', 'Sunrisers Hyderabad', regex=False)
+match_df['team2'] = match_df['team2'].str.replace('Deccan Chargers', 'Sunrisers Hyderabad', regex=False)
+
+# Keep only selected teams
+match_df = match_df[match_df['team1'].isin(teams)]
+match_df = match_df[match_df['team2'].isin(teams)]
+
+# Remove DLS affected matches
+match_df = match_df[match_df['dl_applied'] == 0]
+
+# Keep required columns only
+match_df = match_df[['match_id', 'city', 'winner', 'total_runs']].copy()
+
+
+# ============================================================
+# 3) MERGE BALL-BY-BALL (ONLY 2nd INNINGS)
+# ============================================================
+delivery_df = match_df.merge(delivery, on='match_id', how='inner')
+delivery_df = delivery_df[delivery_df['inning'] == 2].copy()
+
+
+# ============================================================
+# 4) FEATURE ENGINEERING
+# ============================================================
+
+# Current score in chase
+delivery_df['current_score'] = delivery_df.groupby('match_id')['total_runs_y'].cumsum()
+
+# Runs left
+delivery_df['runs_left'] = delivery_df['total_runs_x'] - delivery_df['current_score']
+
+# Balls left (Correct formula: total 120 balls in T20)
+# over in dataset starts from 1 in some versions, ball from 1..6
+# balls_bowled = (over-1)*6 + ball
+delivery_df['balls_left'] = 120 - ((delivery_df['over'] - 1) * 6 + delivery_df['ball'])
+
+# Fix any negative balls_left (bad rows)
+delivery_df = delivery_df[delivery_df['balls_left'] >= 0].copy()
+
+
+# ---------- Wickets left ----------
+delivery_df['player_dismissed'] = delivery_df['player_dismissed'].fillna(0)
+
+# Convert to 0/1 wicket
+delivery_df['player_dismissed'] = delivery_df['player_dismissed'].apply(lambda x: 0 if x == 0 else 1).astype(int)
+
+# Wickets fallen cumulative
+wickets_fallen = delivery_df.groupby('match_id')['player_dismissed'].cumsum()
+
+# Wickets left
+delivery_df['wickets'] = 10 - wickets_fallen
+
+
+# ---------- Run rates ----------
+# Avoid division by zero by replacing 0 with NaN temporarily
+balls_bowled = 120 - delivery_df['balls_left']
+balls_bowled = balls_bowled.replace(0, np.nan)
+
+delivery_df['crr'] = (delivery_df['current_score'] * 6) / balls_bowled
+
+balls_left_safe = delivery_df['balls_left'].replace(0, np.nan)
+delivery_df['rrr'] = (delivery_df['runs_left'] * 6) / balls_left_safe
+
+
+# ============================================================
+# 5) TARGET LABEL
+# ============================================================
+delivery_df['result'] = (delivery_df['batting_team'] == delivery_df['winner']).astype(int)
+
+
+# ============================================================
+# 6) FINAL DATASET
+# ============================================================
+final_df = delivery_df[
+    ['batting_team', 'bowling_team', 'city',
+     'runs_left', 'balls_left', 'wickets',
+     'total_runs_x', 'crr', 'rrr', 'result']
+].copy()
+
+# Clean data
+final_df.dropna(inplace=True)
+
+# Remove cases with balls_left=0 to avoid invalid rrr
+final_df = final_df[final_df['balls_left'] != 0].copy()
+
+# Remove extreme invalid values if any (optional but safe)
+final_df = final_df[final_df['runs_left'] >= -10]   # allows slight negative due to last ball updates
+final_df = final_df[final_df['wickets'] >= 0]
+
+# Shuffle
+final_df = final_df.sample(frac=1, random_state=42).reset_index(drop=True)
+
+print("Final dataset:", final_df.shape)
+
+
+# ============================================================
+# 7) TRAIN TEST SPLIT
+# ============================================================
+X = final_df.iloc[:, :-1]
+y = final_df.iloc[:, -1]
+
+from sklearn.model_selection import train_test_split
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=1
+)
+
+
+# ============================================================
+# 8) PIPELINE (OneHot + Logistic Regression)
+# ============================================================
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+
+trf = ColumnTransformer(
+    transformers=[
+        ('ohe', OneHotEncoder(drop='first', sparse_output=False),
+         ['batting_team', 'bowling_team', 'city'])
+    ],
+    remainder='passthrough'
+)
+
+pipe = Pipeline(steps=[
+    ('step1', trf),
+    ('step2', LogisticRegression(solver='liblinear', max_iter=1000))
+])
+
+pipe.fit(X_train, y_train)
+
+
+# ============================================================
+# 9) EVALUATION
+# ============================================================
+from sklearn.metrics import accuracy_score
+y_pred = pipe.predict(X_test)
+
+print("Accuracy:", accuracy_score(y_test, y_pred))
+
+# Predict probability of win/loss:
+# [prob_lose, prob_win]
+sample_index = 10 if len(X_test) > 10 else 0
+print("Sample predict_proba [Lose, Win]:", pipe.predict_proba(X_test.iloc[[sample_index]])[0])
+
+
+# ============================================================
+# 10) SAVE MODEL
+# ============================================================
+import pickle
+pickle.dump(pipe, open("pipe.pkl", "wb"))
+print("Model saved as pipe.pkl ✅")
